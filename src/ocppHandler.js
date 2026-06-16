@@ -1,26 +1,20 @@
-// ocppHandler.js — processa mensagens OCPP 1.6 (JSON / WebSocket)
-// Protocolo: [MessageTypeId, UniqueId, Action, Payload]
-// MessageTypeId: 2 = CALL, 3 = CALLRESULT, 4 = CALLERROR
+// ocppHandler.js — processa mensagens OCPP 1.6
 
 const store = require('./store');
 const { sendWebhook } = require('./webhook');
 
 const DEBUG = process.env.DEBUG === 'true';
-
-// Mapa de calls pendentes enviados pelo servidor ao charger: uniqueId -> { resolve, reject }
 const pendingCalls = new Map();
 
 function log(chargePointId, ...args) {
   if (DEBUG) console.log(`[OCPP][${chargePointId}]`, ...args);
 }
 
-// ─── Envia uma CALL ao carregador e retorna uma Promise com a resposta ────────
 function sendCall(chargePointId, action, payload = {}) {
   const ws = store.getChargerWs(chargePointId);
   if (!ws || ws.readyState !== 1) {
     return Promise.reject(new Error(`Carregador ${chargePointId} não está conectado`));
   }
-
   const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const message = JSON.stringify([2, uniqueId, action, payload]);
 
@@ -28,8 +22,6 @@ function sendCall(chargePointId, action, payload = {}) {
     pendingCalls.set(uniqueId, { resolve, reject, action });
     ws.send(message);
     log(chargePointId, `→ CALL ${action}`, payload);
-
-    // Timeout de 30s
     setTimeout(() => {
       if (pendingCalls.has(uniqueId)) {
         pendingCalls.delete(uniqueId);
@@ -39,59 +31,38 @@ function sendCall(chargePointId, action, payload = {}) {
   });
 }
 
-// ─── Handler principal de mensagens WebSocket ─────────────────────────────────
 function handleMessage(chargePointId, rawMessage) {
   let msg;
-  try {
-    msg = JSON.parse(rawMessage);
-  } catch {
-    console.error(`[OCPP][${chargePointId}] Mensagem inválida:`, rawMessage);
-    return;
-  }
+  try { msg = JSON.parse(rawMessage); }
+  catch { console.error(`[OCPP][${chargePointId}] Mensagem inválida`); return; }
 
   const [typeId, uniqueId, ...rest] = msg;
 
   if (typeId === 2) {
-    // CALL — mensagem vinda do carregador
     const [action, payload] = rest;
     log(chargePointId, `← CALL ${action}`, payload);
     handleCall(chargePointId, uniqueId, action, payload || {});
-
   } else if (typeId === 3) {
-    // CALLRESULT — resposta do carregador para uma call que enviamos
     const [payload] = rest;
     log(chargePointId, `← CALLRESULT [${uniqueId}]`, payload);
     const pending = pendingCalls.get(uniqueId);
-    if (pending) {
-      pendingCalls.delete(uniqueId);
-      pending.resolve(payload);
-    }
-
+    if (pending) { pendingCalls.delete(uniqueId); pending.resolve(payload); }
   } else if (typeId === 4) {
-    // CALLERROR
     const [errorCode, errorDescription] = rest;
     log(chargePointId, `← CALLERROR [${uniqueId}]`, errorCode, errorDescription);
     const pending = pendingCalls.get(uniqueId);
-    if (pending) {
-      pendingCalls.delete(uniqueId);
-      pending.reject(new Error(`${errorCode}: ${errorDescription}`));
-    }
+    if (pending) { pendingCalls.delete(uniqueId); pending.reject(new Error(`${errorCode}: ${errorDescription}`)); }
   }
 }
 
-// ─── Processa cada action OCPP recebida ──────────────────────────────────────
 function handleCall(chargePointId, uniqueId, action, payload) {
   const ws = store.getChargerWs(chargePointId);
-
   function reply(result) {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify([3, uniqueId, result]));
-    }
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify([3, uniqueId, result]));
   }
 
   switch (action) {
 
-    // ── BootNotification ───────────────────────────────────────────────────
     case 'BootNotification': {
       store.setChargerInfo(chargePointId, {
         vendor: payload.chargePointVendor,
@@ -101,84 +72,51 @@ function handleCall(chargePointId, uniqueId, action, payload) {
         iccid: payload.iccid,
         imsi: payload.imsi,
       });
-
-      reply({
-        status: 'Accepted',
-        currentTime: new Date().toISOString(),
-        interval: 60,  // heartbeat interval em segundos
-      });
-
-      sendWebhook('charger.boot', {
-        chargePointId,
-        ...store.getCharger(chargePointId),
-      });
+      reply({ status: 'Accepted', currentTime: new Date().toISOString(), interval: 60 });
+      sendWebhook('charger.boot', { chargePointId, ...store.getCharger(chargePointId) });
       break;
     }
 
-    // ── Heartbeat ──────────────────────────────────────────────────────────
     case 'Heartbeat': {
       store.updateHeartbeat(chargePointId);
       reply({ currentTime: new Date().toISOString() });
-
-      sendWebhook('charger.heartbeat', {
-        chargePointId,
-        timestamp: new Date().toISOString(),
-      });
+      sendWebhook('charger.heartbeat', { chargePointId, timestamp: new Date().toISOString() });
       break;
     }
 
-    // ── StatusNotification ─────────────────────────────────────────────────
     case 'StatusNotification': {
-      const { connectorId, status, errorCode } = payload;
-      store.setConnectorStatus(chargePointId, connectorId, status, errorCode);
+      const { connectorId, status, errorCode, vendorErrorCode, info } = payload;
+      store.setConnectorStatus(chargePointId, connectorId, status, errorCode, vendorErrorCode, info);
       reply({});
-
       sendWebhook('connector.status', {
-        chargePointId,
-        connectorId,
-        status,
-        errorCode,
+        chargePointId, connectorId, status,
+        errorCode, vendorErrorCode, info,
         timestamp: payload.timestamp || new Date().toISOString(),
       });
       break;
     }
 
-    // ── StartTransaction ───────────────────────────────────────────────────
     case 'StartTransaction': {
       const { connectorId, idTag, meterStart, timestamp } = payload;
       const session = store.startSession(chargePointId, connectorId, idTag);
       session.meterStart = meterStart;
       session.startTime = timestamp || session.startTime;
-
-      reply({
-        transactionId: session.transactionId,
-        idTagInfo: { status: 'Accepted' },
-      });
-
+      reply({ transactionId: session.transactionId, idTagInfo: { status: 'Accepted' } });
       sendWebhook('session.started', {
-        chargePointId,
-        connectorId,
+        chargePointId, connectorId,
         transactionId: session.transactionId,
-        idTag,
-        meterStart,
-        startTime: session.startTime,
+        idTag, meterStart, startTime: session.startTime,
       });
       break;
     }
 
-    // ── StopTransaction ────────────────────────────────────────────────────
     case 'StopTransaction': {
       const { transactionId, meterStop, reason, idTag } = payload;
       const session = store.stopSession(transactionId, meterStop, reason || 'Local');
-
       reply({ idTagInfo: { status: 'Accepted' } });
-
       if (session) {
         sendWebhook('session.stopped', {
-          chargePointId,
-          transactionId,
-          idTag,
-          meterStop,
+          chargePointId, transactionId, idTag, meterStop,
           meterStart: session.meterStart,
           energyDeliveredKwh: session.energyDeliveredKwh,
           startTime: session.startTime,
@@ -189,10 +127,8 @@ function handleCall(chargePointId, uniqueId, action, payload) {
       break;
     }
 
-    // ── MeterValues ────────────────────────────────────────────────────────
     case 'MeterValues': {
       const { transactionId, connectorId, meterValue } = payload;
-
       const simplified = (meterValue || []).map(mv => ({
         timestamp: mv.timestamp,
         values: (mv.sampledValue || []).map(sv => ({
@@ -203,40 +139,42 @@ function handleCall(chargePointId, uniqueId, action, payload) {
           phase: sv.phase,
         })),
       }));
-
-      if (transactionId) {
-        simplified.forEach(mv => store.addMeterValue(transactionId, mv.values));
-      }
-
+      if (transactionId) simplified.forEach(mv => store.addMeterValue(transactionId, mv.values));
       reply({});
-
-      sendWebhook('session.meterValues', {
-        chargePointId,
-        connectorId,
-        transactionId,
-        meterValues: simplified,
-      });
+      sendWebhook('session.meterValues', { chargePointId, connectorId, transactionId, meterValues: simplified });
       break;
     }
 
-    // ── DataTransfer (genérico) ────────────────────────────────────────────
+    case 'FirmwareStatusNotification': {
+      const { status } = payload;
+      store.addLog(chargePointId, 'firmware.status', { status });
+      reply({});
+      sendWebhook('firmware.status', { chargePointId, status, timestamp: new Date().toISOString() });
+      break;
+    }
+
+    case 'DiagnosticsStatusNotification': {
+      const { status } = payload;
+      store.addLog(chargePointId, 'diagnostics.status', { status });
+      reply({});
+      sendWebhook('diagnostics.status', { chargePointId, status, timestamp: new Date().toISOString() });
+      break;
+    }
+
+    case 'Authorize': {
+      reply({ idTagInfo: { status: 'Accepted' } });
+      break;
+    }
+
     case 'DataTransfer': {
       reply({ status: 'Accepted' });
       break;
     }
 
-    // ── Authorize ──────────────────────────────────────────────────────────
-    case 'Authorize': {
-      // Aceita qualquer tag por padrão — ajuste conforme sua lógica de negócio
-      reply({ idTagInfo: { status: 'Accepted' } });
-      break;
-    }
-
     default: {
       log(chargePointId, `Action desconhecida: ${action}`);
-      const ws2 = store.getChargerWs(chargePointId);
-      if (ws2 && ws2.readyState === 1) {
-        ws2.send(JSON.stringify([4, uniqueId, 'NotImplemented', `Action '${action}' não suportada`, {}]));
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify([4, uniqueId, 'NotImplemented', `Action '${action}' não suportada`, {}]));
       }
     }
   }
