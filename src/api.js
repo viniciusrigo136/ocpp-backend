@@ -1,277 +1,215 @@
-// api.js — rotas REST para o sistema da Lovable consumir
+// api.js — rotas REST completas (backend OCPP + persistência local)
 
 const express = require('express');
 const router = express.Router();
 const store = require('./store');
 const { sendCall } = require('./ocppHandler');
+const db = require('./db-persist');
 
 const API_TOKEN = process.env.API_SECRET_TOKEN;
 
 function auth(req, res, next) {
   if (!API_TOKEN) return next();
   const token = req.headers['x-api-token'] || req.query.token;
-  if (token !== API_TOKEN) {
-    return res.status(401).json({ error: 'Token inválido ou ausente' });
-  }
+  if (token !== API_TOKEN) return res.status(401).json({ error: 'Token inválido ou ausente' });
   next();
 }
-
 router.use(auth);
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-router.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// ─── Health ───────────────────────────────────────────────────────────────────
+router.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 // ─── Carregadores ─────────────────────────────────────────────────────────────
-router.get('/chargers', (_req, res) => {
-  res.json(store.getAllChargers());
-});
-
+router.get('/chargers', (_req, res) => res.json(store.getAllChargers()));
 router.get('/chargers/:id', (req, res) => {
-  const charger = store.getCharger(req.params.id);
-  if (!charger) return res.status(404).json({ error: 'Carregador não encontrado' });
-  res.json(charger);
+  const c = store.getCharger(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Carregador não encontrado' });
+  res.json(c);
 });
 
 // ─── Sessões ──────────────────────────────────────────────────────────────────
-router.get('/sessions', (req, res) => {
-  const { chargePointId } = req.query;
-  res.json(store.getAllSessions(chargePointId));
-});
-
+router.get('/sessions', (req, res) => res.json(store.getAllSessions(req.query.chargePointId)));
 router.get('/sessions/:transactionId', (req, res) => {
-  const session = store.getSession(req.params.transactionId);
-  if (!session) return res.status(404).json({ error: 'Sessão não encontrada' });
-  res.json(session);
+  const s = store.getSession(req.params.transactionId);
+  if (!s) return res.status(404).json({ error: 'Sessão não encontrada' });
+  res.json(s);
 });
 
-// ─── Logs OCPP ────────────────────────────────────────────────────────────────
-// GET /api/logs/:chargePointId?limit=50&eventType=connector.status
+// ─── Logs ─────────────────────────────────────────────────────────────────────
 router.get('/logs/:chargePointId', (req, res) => {
-  const { chargePointId } = req.params;
-  const limit = parseInt(req.query.limit) || 50;
-  const eventType = req.query.eventType || null;
-  const logs = store.getLogs(chargePointId, limit, eventType);
-  res.json(logs);
+  res.json(store.getLogs(req.params.chargePointId, parseInt(req.query.limit) || 50, req.query.eventType || null));
 });
 
 // ─── Uptime ───────────────────────────────────────────────────────────────────
-// GET /api/uptime/:chargePointId?from=2026-06-01&to=2026-06-15
 router.get('/uptime/:chargePointId', (req, res) => {
-  const { chargePointId } = req.params;
-  const from = req.query.from ? new Date(req.query.from) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const from = req.query.from ? new Date(req.query.from) : new Date(Date.now() - 7*24*60*60*1000);
   const to = req.query.to ? new Date(req.query.to) : new Date();
-  const uptime = store.getUptimeStats(chargePointId, from, to);
-  res.json(uptime);
+  res.json(store.getUptimeStats(req.params.chargePointId, from, to));
 });
 
 // ─── Falhas ───────────────────────────────────────────────────────────────────
-// GET /api/faults/:chargePointId?limit=200
 router.get('/faults/:chargePointId', (req, res) => {
-  const { chargePointId } = req.params;
-  const limit = parseInt(req.query.limit) || 200;
-  const faults = store.getFaults(chargePointId, limit);
-  res.json(faults);
+  res.json(store.getFaults(req.params.chargePointId, parseInt(req.query.limit) || 200));
 });
 
-// ─── Comandos OCPP ────────────────────────────────────────────────────────────
+// ─── Manutenção ───────────────────────────────────────────────────────────────
+router.get('/maintenance/:id/plans', (req, res) => res.json(db.getMaintenancePlans(req.params.id)));
+router.post('/maintenance/:id/plans', (req, res) => res.json(db.addMaintenancePlan(req.params.id, req.body)));
+router.put('/maintenance/:id/plans/:planId', (req, res) => {
+  const p = db.updateMaintenancePlan(req.params.id, req.params.planId, req.body);
+  if (!p) return res.status(404).json({ error: 'Plano não encontrado' });
+  res.json(p);
+});
+router.delete('/maintenance/:id/plans/:planId', (req, res) => {
+  if (!db.deleteMaintenancePlan(req.params.id, req.params.planId)) return res.status(404).json({ error: 'Plano não encontrado' });
+  res.json({ success: true });
+});
+router.get('/maintenance/:id/records', (req, res) => res.json(db.getMaintenanceRecords(req.params.id)));
+router.post('/maintenance/:id/records', (req, res) => res.json(db.addMaintenanceRecord(req.params.id, req.body)));
 
-// POST /api/chargers/:id/remote-start
-router.post('/chargers/:id/remote-start', async (req, res) => {
-  const { connectorId = 1, idTag = 'REMOTE' } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'RemoteStartTransaction', { connectorId, idTag });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+// ─── Notificações ─────────────────────────────────────────────────────────────
+router.get('/notifications/:id', (req, res) => res.json(db.getNotifications(req.params.id)));
+router.post('/notifications/:id', (req, res) => res.json(db.saveNotifications(req.params.id, req.body.notifications)));
+
+// ─── Parâmetros ───────────────────────────────────────────────────────────────
+router.get('/params/:id', (req, res) => res.json(db.getParams(req.params.id)));
+router.post('/params/:id', (req, res) => res.json(db.saveParams(req.params.id, req.body)));
+
+// ─── Custos de Energia ────────────────────────────────────────────────────────
+router.get('/energy-costs/:id', (req, res) => res.json(db.getEnergyCosts(req.params.id)));
+router.post('/energy-costs/:id', (req, res) => res.json(db.saveEnergyCost(req.params.id, req.body)));
+
+// ─── Regras de Preço ──────────────────────────────────────────────────────────
+router.get('/price-rules/:id', (req, res) => res.json(db.getPriceRules(req.params.id)));
+router.post('/price-rules/:id', (req, res) => res.json(db.addPriceRule(req.params.id, req.body)));
+router.put('/price-rules/:id/:ruleId', (req, res) => {
+  const r = db.updatePriceRule(req.params.id, req.params.ruleId, req.body);
+  if (!r) return res.status(404).json({ error: 'Regra não encontrada' });
+  res.json(r);
+});
+router.delete('/price-rules/:id/:ruleId', (req, res) => {
+  if (!db.deletePriceRule(req.params.id, req.params.ruleId)) return res.status(404).json({ error: 'Regra não encontrada' });
+  res.json({ success: true });
 });
 
-// POST /api/chargers/:id/remote-stop
-router.post('/chargers/:id/remote-stop', async (req, res) => {
-  const { transactionId } = req.body;
-  if (!transactionId) return res.status(400).json({ error: 'transactionId obrigatório' });
-  try {
-    const result = await sendCall(req.params.id, 'RemoteStopTransaction', { transactionId });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+// ─── Datas Especiais ──────────────────────────────────────────────────────────
+router.get('/special-dates/:id', (req, res) => res.json(db.getSpecialDates(req.params.id)));
+router.post('/special-dates/:id', (req, res) => res.json(db.saveSpecialDate(req.params.id, req.body)));
+router.delete('/special-dates/:id/:dateId', (req, res) => {
+  if (!db.deleteSpecialDate(req.params.id, req.params.dateId)) return res.status(404).json({ error: 'Data não encontrada' });
+  res.json({ success: true });
 });
 
-// POST /api/chargers/:id/reset
-router.post('/chargers/:id/reset', async (req, res) => {
-  const { type = 'Soft' } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'Reset', { type });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+// ─── Config OCPP (cache) ──────────────────────────────────────────────────────
+router.get('/ocpp-config/:id', (req, res) => {
+  const config = db.getOcppConfig(req.params.id);
+  res.json(config || { keys: [], updatedAt: null });
 });
 
-// POST /api/chargers/:id/unlock-connector
-router.post('/chargers/:id/unlock-connector', async (req, res) => {
-  const { connectorId = 1 } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'UnlockConnector', { connectorId });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/change-availability
-router.post('/chargers/:id/change-availability', async (req, res) => {
-  const { connectorId = 0, type = 'Operative' } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'ChangeAvailability', { connectorId, type });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/get-configuration
-router.post('/chargers/:id/get-configuration', async (req, res) => {
-  const { key } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'GetConfiguration', key ? { key } : {});
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/change-configuration
-router.post('/chargers/:id/change-configuration', async (req, res) => {
-  const { key, value } = req.body;
-  if (!key || value === undefined) return res.status(400).json({ error: 'key e value obrigatórios' });
-  try {
-    const result = await sendCall(req.params.id, 'ChangeConfiguration', { key, value: String(value) });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/trigger-message
-// Body: { requestedMessage, connectorId }
-// requestedMessage: BootNotification | StatusNotification | Heartbeat | MeterValues | DiagnosticsStatusNotification | FirmwareStatusNotification
-router.post('/chargers/:id/trigger-message', async (req, res) => {
-  const { requestedMessage = 'StatusNotification', connectorId } = req.body;
-  const payload = { requestedMessage };
-  if (connectorId !== undefined) payload.connectorId = connectorId;
-  try {
-    const result = await sendCall(req.params.id, 'TriggerMessage', payload);
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/update-firmware
-// Body: { location, retrieveDate, retries, retryInterval }
-router.post('/chargers/:id/update-firmware', async (req, res) => {
-  const { location, retrieveDate, retries = 3, retryInterval = 60 } = req.body;
-  if (!location) return res.status(400).json({ error: 'location (URL do firmware) obrigatório' });
-  try {
-    const result = await sendCall(req.params.id, 'UpdateFirmware', {
-      location,
-      retrieveDate: retrieveDate || new Date().toISOString(),
-      retries,
-      retryInterval,
-    });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/get-diagnostics
-// Body: { location, startTime, stopTime, retries, retryInterval }
-router.post('/chargers/:id/get-diagnostics', async (req, res) => {
-  const { location, startTime, stopTime, retries = 3, retryInterval = 60 } = req.body;
-  if (!location) return res.status(400).json({ error: 'location (URL de upload) obrigatório' });
-  try {
-    const result = await sendCall(req.params.id, 'GetDiagnostics', {
-      location,
-      startTime,
-      stopTime,
-      retries,
-      retryInterval,
-    });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/reserve-now
-// Body: { connectorId, expiryDate, idTag, reservationId }
-router.post('/chargers/:id/reserve-now', async (req, res) => {
-  const { connectorId = 1, expiryDate, idTag, reservationId } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'ReserveNow', {
-      connectorId,
-      expiryDate: expiryDate || new Date(Date.now() + 30 * 60000).toISOString(),
-      idTag: idTag || 'RESERVE',
-      reservationId: reservationId || Date.now(),
-    });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/cancel-reservation
-// Body: { reservationId }
-router.post('/chargers/:id/cancel-reservation', async (req, res) => {
-  const { reservationId } = req.body;
-  if (!reservationId) return res.status(400).json({ error: 'reservationId obrigatório' });
-  try {
-    const result = await sendCall(req.params.id, 'CancelReservation', { reservationId });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/send-local-list
-// Body: { listVersion, localAuthorizationList, updateType }
-router.post('/chargers/:id/send-local-list', async (req, res) => {
-  const { listVersion = 1, localAuthorizationList = [], updateType = 'Full' } = req.body;
-  try {
-    const result = await sendCall(req.params.id, 'SendLocalList', {
-      listVersion,
-      localAuthorizationList,
-      updateType,
-    });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/chargers/:id/clear-cache
-router.post('/chargers/:id/clear-cache', async (req, res) => {
-  try {
-    const result = await sendCall(req.params.id, 'ClearCache', {});
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// GET /api/chargers/:id/active-session
-// Retorna a sessão ativa de um conector específico
+// ─── Sessão ativa ─────────────────────────────────────────────────────────────
 router.get('/chargers/:id/active-session', (req, res) => {
   const { connectorId } = req.query;
   const sessions = store.getAllSessions(req.params.id);
-  const active = sessions.filter(s => s.status === 'Active' &&
-    (connectorId === undefined || s.connectorId === parseInt(connectorId)));
-  res.json(active);
+  res.json(sessions.filter(s => s.status === 'Active' &&
+    (connectorId === undefined || s.connectorId === parseInt(connectorId))));
+});
+
+// ─── Comandos OCPP ────────────────────────────────────────────────────────────
+async function ocppCmd(res, chargePointId, action, payload) {
+  try {
+    const result = await sendCall(chargePointId, action, payload);
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+router.post('/chargers/:id/remote-start', (req, res) => {
+  const { connectorId = 1, idTag = 'REMOTE' } = req.body;
+  ocppCmd(res, req.params.id, 'RemoteStartTransaction', { connectorId, idTag });
+});
+
+router.post('/chargers/:id/remote-stop', (req, res) => {
+  const { transactionId } = req.body;
+  if (!transactionId) return res.status(400).json({ error: 'transactionId obrigatório' });
+  ocppCmd(res, req.params.id, 'RemoteStopTransaction', { transactionId });
+});
+
+router.post('/chargers/:id/reset', (req, res) => {
+  ocppCmd(res, req.params.id, 'Reset', { type: req.body.type || 'Soft' });
+});
+
+router.post('/chargers/:id/unlock-connector', (req, res) => {
+  ocppCmd(res, req.params.id, 'UnlockConnector', { connectorId: req.body.connectorId || 1 });
+});
+
+router.post('/chargers/:id/change-availability', (req, res) => {
+  ocppCmd(res, req.params.id, 'ChangeAvailability', {
+    connectorId: req.body.connectorId ?? 0,
+    type: req.body.type || 'Operative',
+  });
+});
+
+router.post('/chargers/:id/get-configuration', async (req, res) => {
+  try {
+    const result = await sendCall(req.params.id, 'GetConfiguration', req.body.key ? { key: req.body.key } : {});
+    if (result?.configurationKey) db.saveOcppConfig(req.params.id, result.configurationKey);
+    res.json({ success: true, result });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+router.post('/chargers/:id/change-configuration', (req, res) => {
+  const { key, value } = req.body;
+  if (!key || value === undefined) return res.status(400).json({ error: 'key e value obrigatórios' });
+  ocppCmd(res, req.params.id, 'ChangeConfiguration', { key, value: String(value) });
+});
+
+router.post('/chargers/:id/trigger-message', (req, res) => {
+  const { requestedMessage = 'StatusNotification', connectorId } = req.body;
+  const payload = { requestedMessage };
+  if (connectorId !== undefined) payload.connectorId = connectorId;
+  ocppCmd(res, req.params.id, 'TriggerMessage', payload);
+});
+
+router.post('/chargers/:id/update-firmware', (req, res) => {
+  const { location, retrieveDate, retries = 3, retryInterval = 60 } = req.body;
+  if (!location) return res.status(400).json({ error: 'location obrigatório' });
+  ocppCmd(res, req.params.id, 'UpdateFirmware', {
+    location, retrieveDate: retrieveDate || new Date().toISOString(), retries, retryInterval,
+  });
+});
+
+router.post('/chargers/:id/get-diagnostics', (req, res) => {
+  const { location, startTime, stopTime, retries = 3, retryInterval = 60 } = req.body;
+  if (!location) return res.status(400).json({ error: 'location obrigatório' });
+  ocppCmd(res, req.params.id, 'GetDiagnostics', { location, startTime, stopTime, retries, retryInterval });
+});
+
+router.post('/chargers/:id/reserve-now', (req, res) => {
+  const { connectorId = 1, expiryDate, idTag, reservationId } = req.body;
+  ocppCmd(res, req.params.id, 'ReserveNow', {
+    connectorId,
+    expiryDate: expiryDate || new Date(Date.now() + 30*60000).toISOString(),
+    idTag: idTag || 'RESERVE',
+    reservationId: reservationId || Date.now(),
+  });
+});
+
+router.post('/chargers/:id/cancel-reservation', (req, res) => {
+  if (!req.body.reservationId) return res.status(400).json({ error: 'reservationId obrigatório' });
+  ocppCmd(res, req.params.id, 'CancelReservation', { reservationId: req.body.reservationId });
+});
+
+router.post('/chargers/:id/send-local-list', (req, res) => {
+  ocppCmd(res, req.params.id, 'SendLocalList', {
+    listVersion: req.body.listVersion || 1,
+    localAuthorizationList: req.body.localAuthorizationList || [],
+    updateType: req.body.updateType || 'Full',
+  });
+});
+
+router.post('/chargers/:id/clear-cache', (req, res) => {
+  ocppCmd(res, req.params.id, 'ClearCache', {});
 });
 
 module.exports = router;
